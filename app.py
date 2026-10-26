@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import io
-from datetime import date
-from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,8 +9,8 @@ import requests
 import streamlit as st
 
 API_ROOT = "https://api.imf.org/external/sdmx/3.0"
-# SDMX 3.0 data query; the series key is supplied as a dimension filter.
-DATAFLOW = "IMF.STA,ER,1.0.0"
+# SDMX 3.0 dataflow IDs and series keys as documented by the IMF.
+DATAFLOWS = {"CPI": "CPI", "XDC_USD.PA_RT": "ER"}
 START_PERIOD = "1976-01"
 COUNTRIES = {
     "United States": "USA", "United Kingdom": "GBR", "Euro area": "G163",
@@ -34,71 +32,33 @@ st.caption("Monthly IMF CPI and exchange-rate data. RER = S × CPI₁ / CPI₂; 
 
 
 def fetch_series(iso: str, indicator: str) -> pd.Series:
-    """Fetch one monthly IMF series; tolerate common SDMX response envelopes."""
-    key = f"{iso}.{indicator}.M"
-    params = {"startPeriod": START_PERIOD, "dimension_at_observation": "AllDimensions"}
-    urls = [
-        f"{API_ROOT}/data/{DATAFLOW}/{key}",
-        f"{API_ROOT}/data/{key}",
-    ]
-    errors: list[str] = []
-    for url in urls:
-        try:
-            response = requests.get(url, params=params, headers={"Accept": "application/vnd.sdmx.data+json;version=2"}, timeout=45)
-            response.raise_for_status()
-            payload = response.json()
-            parsed = _parse_sdmx(payload)
-            if not parsed.empty:
-                parsed.name = key
-                return parsed
-            errors.append(f"{url}: response had no observations")
-        except Exception as exc:  # surfaced to user if all endpoints fail
-            errors.append(f"{url}: {exc}")
-    raise RuntimeError("Could not retrieve " + key + ". " + " | ".join(errors))
+    """Fetch one monthly IMF series using the SDMX 3.0 dataflow URL."""
+    if indicator == "CPI":
+        # IMF CPI dimensions: country, index, COICOP, transformation, frequency.
+        key = f"{iso}.CPI._T.IX.M"
+        dataflow = DATAFLOWS["CPI"]
+    elif indicator == "XDC_USD.PA_RT":
+        key = f"{iso}.XDC_USD.PA_RT.M"
+        dataflow = DATAFLOWS[indicator]
+    else:
+        raise ValueError(f"Unsupported IMF indicator: {indicator}")
 
-
-def _parse_sdmx(payload: Any) -> pd.Series:
-    """Extract time/value observations from typical SDMX-JSON structures."""
-    if isinstance(payload, dict):
-        # IMF/SDMX JSON may expose observations as a plain list of records.
-        for k in ("data", "observations", "value"):
-            val = payload.get(k)
-            if isinstance(val, list) and val and isinstance(val[0], dict):
-                df = pd.DataFrame(val)
-                time_col = next((c for c in df if c.lower() in {"time", "period", "time_period", "observation"}), None)
-                value_col = next((c for c in df if c.lower() in {"value", "obs_value"}), None)
-                if time_col and value_col:
-                    return _series_from_pairs(df[time_col], df[value_col])
-        # SDMX-JSON compact structure: structure dimensions and series observations.
-        data = payload.get("data") or payload.get("dataSets")
-        if isinstance(data, list) and data:
-            dataset = data[0]
-            structure = payload.get("structure", {})
-            dims = structure.get("dimensions", {}).get("observation", [])
-            time_dim = next((d for d in dims if d.get("id", "").lower() in {"time_period", "time"}), None)
-            periods = [v.get("id") for v in time_dim.get("values", [])] if time_dim else []
-            series = dataset.get("series", {})
-            if isinstance(series, dict):
-                for item in series.values():
-                    obs = item.get("observations", {})
-                    if isinstance(obs, dict):
-                        return _series_from_pairs((periods[int(i)] for i in obs if str(i).isdigit() and int(i) < len(periods)), (v[0] for v in obs.values()))
-            obs = dataset.get("observations", {})
-            if isinstance(obs, dict):
-                return _series_from_pairs((periods[int(i)] for i in obs if str(i).isdigit() and int(i) < len(periods)), (v[0] for v in obs.values()))
-    return pd.Series(dtype=float)
-
-
-def _series_from_pairs(periods, values) -> pd.Series:
-    rows = []
-    for period, value in zip(periods, values):
-        try:
-            rows.append((pd.Period(str(period), freq="M").to_timestamp(), float(value)))
-        except (ValueError, TypeError):
-            continue
-    if not rows:
-        return pd.Series(dtype=float)
-    return pd.Series(dict(rows), dtype=float).sort_index()
+    url = f"{API_ROOT}/data/dataflow/IMF.STA/{dataflow}/~/{key}"
+    params = {"c[TIME_PERIOD]": "ge:1976-M01"}
+    response = requests.get(url, params=params, headers={"Accept": "text/csv"}, timeout=60)
+    response.raise_for_status()
+    try:
+        observations = pd.read_csv(io.StringIO(response.text))
+    except Exception as exc:
+        raise RuntimeError(f"IMF returned an unreadable CSV for {key}: {exc}") from exc
+    if not {"TIME_PERIOD", "OBS_VALUE"}.issubset(observations.columns):
+        raise RuntimeError(f"IMF response for {key} lacked TIME_PERIOD/OBS_VALUE columns")
+    periods = observations["TIME_PERIOD"].astype(str).str.replace(r"-M(\d+)$", r"-\1", regex=True)
+    index = pd.PeriodIndex(periods, freq="M").to_timestamp()
+    values = pd.to_numeric(observations["OBS_VALUE"], errors="coerce")
+    series = pd.Series(values.to_numpy(), index=index, dtype=float).dropna().sort_index()
+    series.name = key
+    return series
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
